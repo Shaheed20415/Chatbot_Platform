@@ -1,18 +1,22 @@
 const axios = require('axios');
 const fs = require('fs');
 const pdfParse = require('pdf-parse');
+
 const Message = require('../models/Message');
 const Project = require('../models/Project');
 
+/**
+ * Create default project if not exists
+ */
 async function getOrCreateDefaultProject(userId) {
   let project = await Project.findOne({
-    userId,
+    userId: userId,
     name: 'Default Chat'
   });
 
   if (!project) {
     project = await Project.create({
-      userId,
+      userId: userId,
       name: 'Default Chat',
       systemPrompt: 'You are a helpful assistant'
     });
@@ -24,42 +28,48 @@ async function getOrCreateDefaultProject(userId) {
 /* ================= TEXT CHAT ================= */
 exports.chat = async (req, res) => {
   try {
-    let { projectId, message } = req.body;
+    const { projectId, message } = req.body;
+    const userId = req.user.id;
 
     if (!message || !message.trim()) {
       return res.status(400).json({ ok: false, message: 'Empty message' });
     }
 
-    // ✅ AUTO PROJECT (ChatGPT behavior)
-    if (!projectId) {
-      const project = await getOrCreateDefaultProject(req.user.id);
-      projectId = project._id;
+    let activeProjectId = projectId;
+
+    if (!activeProjectId) {
+      const project = await getOrCreateDefaultProject(userId);
+      activeProjectId = project._id;
     }
 
     const project = await Project.findOne({
-      _id: projectId,
-      userId: req.user.id
+      _id: activeProjectId,
+      userId: userId
     });
 
     if (!project) {
-      return res.status(404).json({ ok: false, message: 'Project not found' });
+      return res.status(401).json({
+        error: { message: 'User not found.', code: 401 }
+      });
     }
 
     const messages = [
-      { role: 'system', content: project.systemPrompt || 'You are a helpful assistant' },
+      { role: 'system', content: project.systemPrompt },
       { role: 'user', content: message }
     ];
 
     const aiRes = await axios.post(
       'https://openrouter.ai/api/v1/chat/completions',
       {
-        model: 'openai/gpt-3.5-turbo',
+        model: 'openai/gpt-4o-mini',
         messages
       },
       {
         headers: {
           Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'http://localhost:5000',
+          'X-Title': 'Chatbot Platform'
         }
       }
     );
@@ -67,23 +77,23 @@ exports.chat = async (req, res) => {
     const reply = aiRes.data.choices[0].message.content;
 
     await Message.create({
-      userId: req.user.id,
-      projectId,
+      userId,
+      projectId: activeProjectId,
       role: 'user',
       content: message
     });
 
     await Message.create({
-      userId: req.user.id,
-      projectId,
+      userId,
+      projectId: activeProjectId,
       role: 'assistant',
       content: reply
     });
 
-    res.json({ ok: true, reply, projectId });
+    res.json({ ok: true, reply, projectId: activeProjectId });
 
   } catch (err) {
-    console.error('🔥 CHAT ERROR:', err.message);
+    console.error('🔥 CHAT ERROR:', err.response?.data || err.message);
     res.status(500).json({ ok: false, message: 'Chat failed' });
   }
 };
@@ -91,22 +101,31 @@ exports.chat = async (req, res) => {
 /* ================= FILE + CHAT ================= */
 exports.chatWithFile = async (req, res) => {
   try {
-    let { projectId, message } = req.body;
+    const { projectId, message } = req.body;
     const file = req.file;
+    const userId = req.user.id;
 
     if (!file) {
       return res.status(400).json({ ok: false, message: 'File missing' });
     }
 
-    // ✅ AUTO PROJECT
-    if (!projectId) {
-      const project = await getOrCreateDefaultProject(req.user.id);
-      projectId = project._id;
+    let activeProjectId = projectId;
+
+    if (!activeProjectId) {
+      const project = await getOrCreateDefaultProject(userId);
+      activeProjectId = project._id;
     }
 
-    let extractedText = '';
+    
 
-    // ✅ PDF READ (THIS NOW WORKS)
+const project =
+  (activeProjectId &&
+    await Project.findOne({ _id: activeProjectId })) ||
+  await getOrCreateDefaultProject(userId);
+
+activeProjectId = project._id;
+
+    let extractedText = '';
     if (file.mimetype === 'application/pdf') {
       const buffer = fs.readFileSync(file.path);
       const data = await pdfParse(buffer);
@@ -117,26 +136,22 @@ exports.chatWithFile = async (req, res) => {
       { role: 'system', content: 'You analyze uploaded documents.' },
       {
         role: 'user',
-        content: `
-FILE CONTENT:
-${extractedText}
-
-USER QUESTION:
-${message || 'Analyze the document'}
-        `
+        content: `FILE CONTENT:\n${extractedText}\n\nQUESTION:\n${message || 'Analyze'}`
       }
     ];
 
     const aiRes = await axios.post(
       'https://openrouter.ai/api/v1/chat/completions',
       {
-        model: 'openai/gpt-3.5-turbo',
+        model: 'openai/gpt-4o-mini',
         messages
       },
       {
         headers: {
           Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'http://localhost:5000',
+          'X-Title': 'Chatbot Platform'
         }
       }
     );
@@ -144,23 +159,23 @@ ${message || 'Analyze the document'}
     const reply = aiRes.data.choices[0].message.content;
 
     await Message.create({
-      userId: req.user.id,
-      projectId,
+      userId,
+      projectId: activeProjectId,
       role: 'user',
-      content: message || `Uploaded file: ${file.originalname}`
+      content: message || file.originalname
     });
 
     await Message.create({
-      userId: req.user.id,
-      projectId,
+      userId,
+      projectId: activeProjectId,
       role: 'assistant',
       content: reply
     });
 
-    res.json({ ok: true, reply, projectId });
+    res.json({ ok: true, reply, projectId: activeProjectId });
 
   } catch (err) {
-    console.error('🔥 FILE CHAT ERROR:', err.message);
+    console.error('🔥 FILE CHAT ERROR:', err.response?.data || err.message);
     res.status(500).json({ ok: false, message: 'File analysis failed' });
   }
 };
